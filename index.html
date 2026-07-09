@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SIGNAL/MIDI — 音声解析コンソール</title>
+<style>
+@import url('https://cdnjs.cloudflare.com/ajax/libs/jetbrains-mono/2.304/index.min.css');
+
+:root{
+  --bg-0: #0a0f0d;
+  --bg-1: #0d1512;
+  --bg-2: #121c18;
+  --panel-line: #1e2c26;
+  --ink-dim: #5c7268;
+  --ink: #b8c4bc;
+  --ink-bright: #e8f0ea;
+  --signal: #7fe0a8;
+  --signal-dim: #3f8362;
+  --amber: #e0a458;
+  --amber-dim: #8a6438;
+  --red: #e0685c;
+  --mono: 'JetBrains Mono', 'Consolas', monospace;
+  --sans: -apple-system, "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif;
+}
+
+*{ box-sizing: border-box; }
+html,body{
+  margin:0; padding:0;
+  background: var(--bg-0);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+body{
+  background-image:
+    radial-gradient(ellipse 1200px 600px at 50% -10%, rgba(127,224,168,0.05), transparent);
+}
+
+::selection{ background: var(--signal-dim); color: var(--ink-bright); }
+
+.scanlines{
+  pointer-events:none;
+  position:fixed; inset:0; z-index:9999;
+  background: repeating-linear-gradient(
+    0deg, rgba(0,0,0,0.0) 0px, rgba(0,0,0,0.0) 2px,
+    rgba(0,0,0,0.012) 3px, rgba(0,0,0,0.0) 4px
+  );
+  opacity:0.5;
+}
+
+.wrap{
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 20px 80px;
+}
+
+/* ---------- HEADER ---------- */
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:flex-end;
+  border-bottom: 1px solid var(--panel-line);
+  padding-bottom: 18px;
+  margin-bottom: 22px;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.brand{
+  font-family: var(--mono);
+  letter-spacing: 0.02em;
+}
+.brand .mark{
+  font-size: 11px;
+  color: var(--signal);
+  letter-spacing: 0.25em;
+  display:block;
+  margin-bottom: 6px;
+}
+.brand h1{
+  margin:0;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--ink-bright);
+  letter-spacing: -0.01em;
+}
+.brand .sub{
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--ink-dim);
+  margin-top: 4px;
+}
+.status-cluster{
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  text-align: right;
+  line-height: 1.8;
+}
+.status-cluster .dot{
+  display:inline-block;
+  width:6px; height:6px;
+  border-radius:50%;
+  background: var(--ink-dim);
+  margin-right:6px;
+  vertical-align: 1px;
+}
+.status-cluster .dot.live{ background: var(--signal); box-shadow: 0 0 6px var(--signal); }
+
+/* ---------- PANEL SYSTEM ---------- */
+.panel{
+  background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
+  border: 1px solid var(--panel-line);
+  border-radius: 3px;
+  margin-bottom: 16px;
+  position: relative;
+}
+.panel-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--panel-line);
+}
+.panel-head .tag{
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.15em;
+  color: var(--signal-dim);
+  text-transform: uppercase;
+}
+.panel-head h2{
+  font-size: 13px;
+  margin: 2px 0 0;
+  color: var(--ink-bright);
+  font-weight: 600;
+}
+.panel-body{ padding: 16px; }
+
+/* ---------- DROPZONE ---------- */
+.dropzone{
+  border: 1px dashed var(--panel-line);
+  border-radius: 3px;
+  padding: 34px 20px;
+  text-align:center;
+  cursor:pointer;
+  transition: border-color .15s ease, background .15s ease;
+  position: relative;
+}
+.dropzone:hover, .dropzone.drag{
+  border-color: var(--signal-dim);
+  background: rgba(127,224,168,0.03);
+}
+.dropzone input{ display:none; }
+.dropzone .glyph{
+  font-family: var(--mono);
+  font-size: 26px;
+  color: var(--signal-dim);
+  margin-bottom: 10px;
+  letter-spacing: 4px;
+}
+.dropzone .prompt{
+  color: var(--ink-bright);
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.dropzone .hint{
+  color: var(--ink-dim);
+  font-size: 11.5px;
+  font-family: var(--mono);
+}
+.file-loaded{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.file-loaded .fname{
+  font-family: var(--mono);
+  color: var(--ink-bright);
+  font-size: 13px;
+}
+.file-loaded .fmeta{
+  font-family: var(--mono);
+  color: var(--ink-dim);
+  font-size: 11px;
+  margin-top: 3px;
+}
+.btn-ghost{
+  background: transparent;
+  border: 1px solid var(--panel-line);
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 12px;
+  border-radius: 2px;
+  cursor:pointer;
+  transition: all .15s ease;
+}
+.btn-ghost:hover{ border-color: var(--ink-dim); color: var(--ink); }
+
+/* ---------- MODE SELECTOR ---------- */
+.mode-grid{
+  display:grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+@media (max-width: 860px){ .mode-grid{ grid-template-columns: repeat(2,1fr); } }
+.mode-card{
+  border: 1px solid var(--panel-line);
+  border-radius: 3px;
+  padding: 12px 12px;
+  cursor:pointer;
+  transition: all .15s ease;
+  background: rgba(255,255,255,0.01);
+}
+.mode-card:hover{ border-color: var(--signal-dim); }
+.mode-card.active{
+  border-color: var(--signal);
+  background: rgba(127,224,168,0.06);
+  box-shadow: inset 0 0 0 1px rgba(127,224,168,0.15);
+}
+.mode-card .idx{
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-dim);
+  letter-spacing: 0.1em;
+}
+.mode-card.active .idx{ color: var(--signal); }
+.mode-card .name{
+  font-size: 13px;
+  color: var(--ink-bright);
+  margin: 6px 0 4px;
+  font-weight: 600;
+}
+.mode-card .desc{
+  font-size: 11px;
+  color: var(--ink-dim);
+  line-height: 1.5;
+}
+
+/* ---------- CONTROLS ---------- */
+.control-row{
+  display:flex;
+  align-items:center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.control-row:last-child{ border-bottom:none; }
+.control-label{
+  font-size: 12.5px;
+  color: var(--ink);
+  min-width: 140px;
+  flex-shrink:0;
+}
+.control-label .unit{
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-left: 6px;
+}
+.control-input{
+  flex:1;
+  display:flex;
+  align-items:center;
+  gap: 10px;
+}
+input[type="range"]{
+  -webkit-appearance:none;
+  flex:1;
+  height: 3px;
+  background: var(--panel-line);
+  border-radius: 2px;
+  outline:none;
+}
+input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance:none;
+  width: 12px; height: 12px;
+  border-radius:50%;
+  background: var(--signal);
+  cursor:pointer;
+  box-shadow: 0 0 6px rgba(127,224,168,0.5);
+}
+.control-value{
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--signal);
+  min-width: 56px;
+  text-align:right;
+}
+select{
+  background: var(--bg-0);
+  border: 1px solid var(--panel-line);
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 2px;
+  outline:none;
+  cursor:pointer;
+}
+.toggle{
+  width: 34px; height: 18px;
+  border-radius: 10px;
+  background: var(--panel-line);
+  position: relative;
+  cursor:pointer;
+  transition: background .15s ease;
+  flex-shrink:0;
+}
+.toggle.on{ background: var(--signal-dim); }
+.toggle .knob{
+  position:absolute; top:2px; left:2px;
+  width:14px; height:14px;
+  border-radius:50%;
+  background: var(--ink);
+  transition: left .15s ease, background .15s ease;
+}
+.toggle.on .knob{ left:18px; background: var(--signal); }
+
+details.advanced{ margin-top: 4px; }
+details.advanced summary{
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  cursor:pointer;
+  letter-spacing: 0.08em;
+  padding: 8px 0;
+  list-style: none;
+}
+details.advanced summary::-webkit-details-marker{ display:none; }
+details.advanced summary::before{
+  content: "▸ ";
+  color: var(--signal-dim);
+}
+details.advanced[open] summary::before{ content: "▾ "; }
+
+/* ---------- ACTION BAR ---------- */
+.action-bar{
+  display:flex;
+  align-items:center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.btn-main{
+  background: var(--signal);
+  color: #06120c;
+  border:none;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 12.5px;
+  letter-spacing: 0.06em;
+  padding: 11px 22px;
+  border-radius: 2px;
+  cursor:pointer;
+  transition: filter .15s ease, transform .1s ease;
+}
+.btn-main:hover:not(:disabled){ filter: brightness(1.12); }
+.btn-main:active:not(:disabled){ transform: scale(0.98); }
+.btn-main:disabled{ opacity:0.35; cursor:not-allowed; }
+.btn-secondary{
+  background: transparent;
+  border: 1px solid var(--signal-dim);
+  color: var(--signal);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 10px 18px;
+  border-radius: 2px;
+  cursor:pointer;
+  transition: all .15s ease;
+}
+.btn-secondary:hover:not(:disabled){ background: rgba(127,224,168,0.06); }
+.btn-secondary:disabled{ opacity:0.3; cursor:not-allowed; }
+
+.progress-line{
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-dim);
+  flex:1;
+  min-width: 180px;
+}
+.progress-track{
+  height: 2px;
+  background: var(--panel-line);
+  margin-top:6px;
+  border-radius:1px;
+  overflow:hidden;
+}
+.progress-fill{
+  height:100%;
+  width:0%;
+  background: var(--signal);
+  transition: width .2s ease;
+}
+
+/* ---------- VISUALIZATION ---------- */
+.viz-stack{ display:flex; flex-direction:column; gap: 1px; background: var(--panel-line); }
+.viz-row{
+  background: var(--bg-1);
+  position: relative;
+}
+.viz-row .viz-label{
+  position:absolute;
+  top: 6px; left: 10px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  color: var(--ink-dim);
+  z-index: 2;
+  pointer-events:none;
+}
+canvas{ display:block; width:100%; }
+
+.legend{
+  display:flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  border-top: 1px solid var(--panel-line);
+}
+.legend span{ display:inline-flex; align-items:center; gap:6px; }
+.legend .sw{ width:9px; height:9px; border-radius:2px; }
+
+/* ---------- METRICS ---------- */
+.metrics-grid{
+  display:grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--panel-line);
+}
+@media (max-width: 700px){ .metrics-grid{ grid-template-columns: repeat(2,1fr); } }
+.metric{
+  background: var(--bg-1);
+  padding: 14px 16px;
+}
+.metric .m-label{
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--ink-dim);
+  text-transform:uppercase;
+}
+.metric .m-value{
+  font-family: var(--mono);
+  font-size: 20px;
+  color: var(--signal);
+  margin-top: 6px;
+  font-weight: 600;
+}
+.metric .m-sub{
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-top:2px;
+}
+
+/* ---------- OUTPUT / DOWNLOAD ---------- */
+.output-grid{
+  display:grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+@media (max-width: 700px){ .output-grid{ grid-template-columns: 1fr; } }
+.output-card{
+  border: 1px solid var(--panel-line);
+  border-radius: 3px;
+  padding: 16px;
+  display:flex;
+  flex-direction:column;
+  gap: 10px;
+}
+.output-card .oc-title{
+  font-size: 13px;
+  color: var(--ink-bright);
+  font-weight:600;
+}
+.output-card .oc-desc{
+  font-size: 11.5px;
+  color: var(--ink-dim);
+  line-height:1.6;
+  flex:1;
+}
+
+/* ---------- PLAYBACK ---------- */
+.playback-bar{
+  display:flex;
+  align-items:center;
+  gap: 14px;
+}
+.play-btn{
+  width: 38px; height: 38px;
+  border-radius:50%;
+  border: 1px solid var(--signal-dim);
+  background: transparent;
+  color: var(--signal);
+  cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+  font-size: 14px;
+  flex-shrink:0;
+  transition: all .15s ease;
+}
+.play-btn:hover{ background: rgba(127,224,168,0.08); }
+.playback-time{
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  min-width: 92px;
+}
+.playback-track{
+  flex:1;
+  height: 3px;
+  background: var(--panel-line);
+  border-radius: 2px;
+  position:relative;
+  cursor:pointer;
+}
+.playback-progress{
+  position:absolute; top:0; left:0; height:100%;
+  background: var(--signal);
+  border-radius:2px;
+  width:0%;
+}
+
+/* ---------- MISC ---------- */
+.footer-note{
+  text-align:center;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-top: 30px;
+  letter-spacing: 0.05em;
+}
+.hidden{ display:none !important; }
+
+.warn-banner{
+  border: 1px solid var(--amber-dim);
+  background: rgba(224,164,88,0.06);
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 10px 14px;
+  border-radius: 3px;
+  margin-bottom: 16px;
+  display:flex;
+  align-items:center;
+  gap: 8px;
+}
+
+@keyframes pulse{
+  0%,100%{ opacity:1; }
+  50%{ opacity: 0.4; }
+}
+.pulsing{ animation: pulse 1.4s ease-in-out infinite; }
+</style>
+</head>
+<body>
+<div class="scanlines"></div>
+<div class="wrap">
+
+  <div class="header">
+    <div class="brand">
+      <span class="mark">SIGNAL / MIDI RECONSTRUCTION CONSOLE</span>
+      <h1>音声 → MIDI 再現エンジン</h1>
+      <div class="sub">音声を厳密に採譜するのではなく、演奏可能なデータへ再解釈します</div>
+    </div>
+    <div class="status-cluster">
+      <div><span class="dot" id="statusDot"></span><span id="statusText">待機中 — 音声ファイル未読込</span></div>
+      <div id="engineInfo">Web Audio Engine / ローカル処理のみ</div>
+    </div>
+  </div>
+
+  <!-- INPUT PANEL -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">01 — INPUT</div>
+        <h2>音声ファイル読込</h2>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.webm,audio/*">
+        <div id="dropzoneEmpty">
+          <div class="glyph">▁▃▅▇▅▃▁</div>
+          <div class="prompt">クリックまたはドラッグ&ドロップで音声ファイルを選択</div>
+          <div class="hint">対応形式: MP3 / WAV / M4A / AAC / OGG / FLAC / WEBM</div>
+        </div>
+        <div id="dropzoneLoaded" class="file-loaded hidden">
+          <div>
+            <div class="fname" id="loadedFname">—</div>
+            <div class="fmeta" id="loadedFmeta">—</div>
+          </div>
+          <button class="btn-ghost" id="btnReplace" type="button">別のファイルを選ぶ</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODE PANEL -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">02 — ANALYSIS MODE</div>
+        <h2>解析モード選択</h2>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="mode-grid" id="modeGrid"></div>
+    </div>
+  </div>
+
+  <!-- SETTINGS PANEL -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">03 — PARAMETERS</div>
+        <h2>解析設定</h2>
+      </div>
+    </div>
+    <div class="panel-body">
+
+      <div class="control-row">
+        <div class="control-label">フレーム長<span class="unit">FRAME</span></div>
+        <div class="control-input">
+          <input type="range" id="frameLen" min="5" max="50" step="1" value="20">
+          <div class="control-value" id="frameLenVal">20 ms</div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">ホップ長<span class="unit">HOP</span></div>
+        <div class="control-input">
+          <input type="range" id="hopLen" min="2" max="25" step="1" value="10">
+          <div class="control-value" id="hopLenVal">10 ms</div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">自動フレーム調整</div>
+        <div class="control-input">
+          <div class="toggle on" id="toggleAutoFrame"><div class="knob"></div></div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">最小ノート長<span class="unit">MIN NOTE</span></div>
+        <div class="control-input">
+          <input type="range" id="minNote" min="10" max="150" step="5" value="30">
+          <div class="control-value" id="minNoteVal">60 ms</div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">無音閾値<span class="unit">SILENCE</span></div>
+        <div class="control-input">
+          <input type="range" id="silenceThresh" min="1" max="60" step="1" value="15">
+          <div class="control-value" id="silenceThreshVal">-42 dB</div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">ベロシティ反映の強さ</div>
+        <div class="control-input">
+          <input type="range" id="velSens" min="0" max="100" step="1" value="70">
+          <div class="control-value" id="velSensVal">70%</div>
+        </div>
+      </div>
+      <p style="font-size:11px; color:var(--ink-dim); margin: -4px 0 4px; line-height:1.6;">
+        「和音・密集音」モードでは、この値を下げるほど弱い音も聞き取りやすい強さに持ち上げます（強弱の差を圧縮）。上げるほど強い音だけが際立ちます。
+      </p>
+      <div class="control-row">
+        <div class="control-label">ピッチベンド使用</div>
+        <div class="control-input">
+          <div class="toggle on" id="togglePitchBend"><div class="knob"></div></div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">出力トラック構成</div>
+        <div class="control-input">
+          <select id="trackMode">
+            <option value="single">単一トラック</option>
+            <option value="multi" selected>複数トラック（音高/リズム/ノイズ/補助）</option>
+          </select>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">音色（音高トラック）</div>
+        <div class="control-input">
+          <select id="instrument">
+            <option value="auto">自動（モードにより変化）</option>
+            <option value="0" selected>ピアノ (Acoustic Grand Piano)</option>
+            <option value="4">エレピ (Electric Piano)</option>
+            <option value="6">ハープシコード</option>
+            <option value="24">アコースティックギター</option>
+            <option value="40">バイオリン</option>
+            <option value="42">チェロ</option>
+            <option value="56">トランペット</option>
+            <option value="65">アルトサックス</option>
+            <option value="73">フルート</option>
+            <option value="53">ボイス (Voice Oohs)</option>
+            <option value="80">シンセリード</option>
+            <option value="88">シンセパッド</option>
+          </select>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control-label">拾う音の感度<span class="unit">音階の多さ</span></div>
+        <div class="control-input">
+          <input type="range" id="noteMerge" min="0" max="100" step="1" value="15">
+          <div class="control-value" id="noteMergeVal">細かく</div>
+        </div>
+      </div>
+      <p style="font-size:11px; color:var(--ink-dim); margin: -4px 0 4px; line-height:1.6;">
+        一定時間ごとに区切った音を、周波数の強さでそのまま音階に変換します。
+        「最大限細かく」に近づけるほど、弱い音まで拾って使われる音階の種類が増えます。
+        あわせて下の「最小ノート長」も短くすると、より多くの音が反映されます。
+        （「和音・密集音」モードでは検出できた音をすべて鳴らすため、この設定は使用されません。強弱の調整は下の「ベロシティ反映の強さ」で行います。）
+      </p>
+
+      <details class="advanced">
+        <summary>上級設定</summary>
+        <div class="control-row">
+          <div class="control-label">イベント検出感度</div>
+          <div class="control-input">
+            <input type="range" id="eventSens" min="0" max="100" step="1" value="55">
+            <div class="control-value" id="eventSensVal">55%</div>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ACTION -->
+  <div class="panel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">04 — EXECUTE</div>
+        <h2>解析実行</h2>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="action-bar">
+        <button class="btn-main" id="btnAnalyze" disabled>解析開始</button>
+        <button class="btn-secondary" id="btnReanalyze" disabled>再解析</button>
+        <div class="progress-line hidden" id="progressWrap">
+          <div id="progressText">準備中...</div>
+          <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        </div>
+      </div>
+      <div class="control-row" style="margin-top:8px;">
+        <div class="control-label">完了時に通知</div>
+        <div class="control-input">
+          <div class="toggle on" id="toggleNotify"><div class="knob"></div></div>
+        </div>
+      </div>
+      <p style="font-size:11px; color:var(--ink-dim); margin: 4px 0 0; line-height:1.6;">
+        解析はバックグラウンドのワーカー上で実行されるため、他のタブを見ている間も進み続けます。オンにすると、完了時にブラウザ通知でお知らせします（初回はブラウザの通知許可が必要です）。
+      </p>
+    </div>
+  </div>
+
+  <!-- VISUALIZATION -->
+  <div class="panel hidden" id="vizPanel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">05 — VISUALIZATION</div>
+        <h2>解析結果</h2>
+      </div>
+      <div class="playback-bar">
+        <button class="play-btn" id="btnPlay">▶</button>
+        <div class="playback-time" id="playTime">0:00 / 0:00</div>
+      </div>
+    </div>
+    <div class="playback-track" id="playTrack" style="margin: 0 16px 12px;">
+      <div class="playback-progress" id="playProgress"></div>
+    </div>
+    <div class="viz-stack">
+      <div class="viz-row"><span class="viz-label">WAVEFORM</span><canvas id="cvWave" height="70"></canvas></div>
+      <div class="viz-row"><span class="viz-label">SPECTROGRAM</span><canvas id="cvSpec" height="120"></canvas></div>
+      <div class="viz-row"><span class="viz-label">PITCH / NOTES</span><canvas id="cvPitch" height="150"></canvas></div>
+      <div class="viz-row"><span class="viz-label">EVENTS &amp; VELOCITY</span><canvas id="cvEvent" height="70"></canvas></div>
+    </div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--signal)"></span>推定ピッチ / ノート</span>
+      <span><span class="sw" style="background:var(--amber)"></span>イベント（打撃・ノイズ）</span>
+      <span><span class="sw" style="background:var(--red)"></span>無音・低信頼区間</span>
+    </div>
+  </div>
+
+  <!-- METRICS -->
+  <div class="panel hidden" id="metricsPanel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">06 — SUMMARY</div>
+        <h2>解析サマリー</h2>
+      </div>
+    </div>
+    <div class="metrics-grid">
+      <div class="metric"><div class="m-label">検出ノート数</div><div class="m-value" id="mNotes">—</div><div class="m-sub">Note-On events</div></div>
+      <div class="metric"><div class="m-label">イベント数</div><div class="m-value" id="mEvents">—</div><div class="m-sub">Percussive / noise</div></div>
+      <div class="metric"><div class="m-label">推定音域</div><div class="m-value" id="mRange">—</div><div class="m-sub">MIDI note span</div></div>
+      <div class="metric"><div class="m-label">採用モード</div><div class="m-value" id="mMode">—</div><div class="m-sub">Final classification</div></div>
+    </div>
+  </div>
+
+  <!-- OUTPUT -->
+  <div class="panel hidden" id="outputPanel">
+    <div class="panel-head">
+      <div>
+        <div class="tag">07 — OUTPUT</div>
+        <h2>書き出し</h2>
+      </div>
+    </div>
+    <div class="panel-body">
+      <div class="output-grid">
+        <div class="output-card">
+          <div class="oc-title">MIDIファイル (.mid)</div>
+          <div class="oc-desc">一般的なMIDIプレーヤー・DAWで再生可能な標準フォーマットです。ノート、ベロシティ、ピッチベンド、CCを含みます。</div>
+          <button class="btn-main" id="btnDownloadMidi">MIDIをダウンロード</button>
+        </div>
+        <div class="output-card">
+          <div class="oc-title">中間データ (.json)</div>
+          <div class="oc-desc">フレーム単位のピッチ・音量・イベント解析結果です。手動編集や別ツールでの再利用に使えます。</div>
+          <button class="btn-secondary" id="btnDownloadJson">JSONをダウンロード</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer-note">ALL PROCESSING RUNS LOCALLY IN YOUR BROWSER — 音声データは外部送信されません</div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
