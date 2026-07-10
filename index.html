@@ -552,6 +552,13 @@ canvas{ display:block; width:100%; }
   align-items:center;
   gap: 8px;
 }
+code{
+  font-family: var(--mono);
+  background: rgba(255,255,255,0.06);
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-size: 0.95em;
+}
 
 @keyframes pulse{
   0%,100%{ opacity:1; }
@@ -574,6 +581,19 @@ canvas{ display:block; width:100%; }
       <div><span class="dot" id="statusDot"></span><span id="statusText">待機中 — 音声ファイル未読込</span></div>
       <div id="engineInfo">Web Audio Engine / ローカル処理のみ</div>
     </div>
+  </div>
+
+  <div class="warn-banner hidden" id="fileProtocolWarning" style="align-items:flex-start; flex-direction:column; line-height:1.8;">
+    <div><strong>⚠ このページはローカルファイルとして開かれています</strong></div>
+    <div>
+      バックグラウンド解析（Web Worker）はブラウザの仕様上 <code>file://</code> から直接開いた状態では使用できません。
+      以下のいずれかでローカルサーバー経由で開き直してください。
+    </div>
+    <ul style="margin:4px 0 0; padding-left:20px;">
+      <li>Node.js: このフォルダで <code>npx serve .</code> を実行し、表示されたURLを開く</li>
+      <li>Python: このフォルダで <code>python3 -m http.server 8000</code> を実行し、<code>http://localhost:8000</code> を開く</li>
+      <li>VS Code: 「Live Server」拡張機能を入れて index.html を右クリック→「Open with Live Server」</li>
+    </ul>
   </div>
 
   <!-- INPUT PANEL -->

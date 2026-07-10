@@ -1097,15 +1097,44 @@ self.onmessage = async (e) => {
       const analysis = await analyzeAudio(audioBufferLike, mode, params, onProgress);
       const midiBytes = buildMidiFile(analysis, params);
 
-      // Canvas描画用に必要な情報を抜き出してメインスレッドへ返す。
-      // mag(スペクトル)はスペクトログラム描画に、noteEnergiesは和音モードの
-      // 可視化に必要なため、どちらもTypedArrayのまま転送する。
-      const framesLite = analysis.frames.map((f) => ({
-        t: f.t, amp: f.amp, db: f.db, isSilent: f.isSilent,
-        centroid: f.centroid, zcr: f.zcr,
-        mag: f.mag || null,
-        noteEnergies: f.noteEnergies || null
-      }));
+      // ---------------------------------------------------------
+      // メインスレッドへ返す可視化用データを軽量化する。
+      //
+      // 以前はフレームごとに個別のFloat32Array（mag, noteEnergies）を
+      // 持たせていたが、これだと長い曲では数千個のオブジェクトを
+      // 生成することになり、Worker→メインスレッドの転送コストが
+      // 非常に大きくなっていた（環境によっては転送に失敗したり、
+      // 極端に遅くなる原因になっていた）。
+      //
+      // 対策として:
+      //   1. 可視化に使う分だけフレームを間引く（最大400点程度で十分）
+      //   2. mag / noteEnergies は「全フレーム分をまとめた1本の
+      //      Float32Array」として持たせ、個別オブジェクトの生成数を
+      //      1個に抑える（フラット化）
+      // ---------------------------------------------------------
+      const MAX_VIZ_FRAMES = 400;
+      const totalFrames = analysis.frames.length;
+      const vizStep = Math.max(1, Math.ceil(totalFrames / MAX_VIZ_FRAMES));
+      const vizFrameIndices = [];
+      for (let i = 0; i < totalFrames; i += vizStep) vizFrameIndices.push(i);
+
+      const magLen = analysis.frames.find((f) => f.mag)?.mag.length || 0;
+      const noteEnergiesLen = analysis.frames.find((f) => f.noteEnergies)?.noteEnergies.length || 0;
+
+      const vizCount = vizFrameIndices.length;
+      const magFlat = magLen ? new Float32Array(vizCount * magLen) : null;
+      const noteEnergiesFlat = noteEnergiesLen ? new Float32Array(vizCount * noteEnergiesLen) : null;
+
+      const framesLite = vizFrameIndices.map((idx, i) => {
+        const f = analysis.frames[idx];
+        if (magFlat && f.mag) magFlat.set(f.mag, i * magLen);
+        if (noteEnergiesFlat && f.noteEnergies) noteEnergiesFlat.set(f.noteEnergies, i * noteEnergiesLen);
+        return {
+          t: f.t, amp: f.amp, db: f.db, isSilent: f.isSilent,
+          centroid: f.centroid, zcr: f.zcr,
+          hasNoteEnergies: !!f.noteEnergies
+        };
+      });
 
       const result = {
         mode: analysis.mode,
@@ -1118,6 +1147,8 @@ self.onmessage = async (e) => {
         frameSize: analysis.frameSize,
         hopSize: analysis.hopSize,
         frames: framesLite,
+        magLen, noteEnergiesLen,
+        magFlat, noteEnergiesFlat,
         events: analysis.events,
         notes: analysis.notes,
         waveformPeaks: analysis.waveformPeaks,
@@ -1125,11 +1156,12 @@ self.onmessage = async (e) => {
       };
 
       // Transferableオブジェクト(ArrayBuffer)は転送するとコピーコストがかからず高速。
+      // フラット化したことで、ここで転送するArrayBufferは
+      // 「MIDIバイナリ」「mag全体」「noteEnergies全体」の3個だけになる
+      // (以前はフレーム数×2個、数千個になり得ていた)。
       const transferList = [midiBytes.buffer];
-      framesLite.forEach((f) => {
-        if (f.noteEnergies) transferList.push(f.noteEnergies.buffer);
-        if (f.mag) transferList.push(f.mag.buffer);
-      });
+      if (magFlat) transferList.push(magFlat.buffer);
+      if (noteEnergiesFlat) transferList.push(noteEnergiesFlat.buffer);
 
       self.postMessage({ type: 'done', payload: result }, transferList);
     } catch (err) {

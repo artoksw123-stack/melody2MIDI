@@ -90,6 +90,7 @@ const $ = (id) => document.getElementById(id);
 const el = {
   statusDot: $('statusDot'),
   statusText: $('statusText'),
+  fileProtocolWarning: $('fileProtocolWarning'),
   dropzone: $('dropzone'),
   fileInput: $('fileInput'),
   dropzoneEmpty: $('dropzoneEmpty'),
@@ -342,6 +343,9 @@ function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
 }
 
+// 和音モードの可視化・JSON出力で使う定数（analyzer-worker.js内の定義と対応させる）
+const CHROMA_MIDI_MIN = 21; // A0
+
 /* =========================================================
    解析ワーカーとの通信
    タブがバックグラウンドになっても解析が進み続けるよう、
@@ -349,22 +353,53 @@ function clamp(v, min, max) {
    ========================================================= */
 
 let analyzerWorker = null;
+let analyzerWorkerFailed = false;
 
 function getAnalyzerWorker() {
+  if (analyzerWorkerFailed) {
+    throw buildWorkerUnavailableError();
+  }
   if (!analyzerWorker) {
+    // file:// で直接開いている場合、Workerの生成自体がブラウザの
+    // セキュリティ制約でブロックされる。この場合は new Worker() が
+    // 同期的に例外を投げないことがあり、代わりに非同期の 'error'
+    // イベントとして失敗が通知されるブラウザもあるため、
+    // 事前にプロトコルをチェックしてはっきり原因を伝える。
+    if (window.location.protocol === 'file:') {
+      analyzerWorkerFailed = true;
+      throw buildWorkerUnavailableError();
+    }
     try {
       analyzerWorker = new Worker('./analyzer-worker.js');
+      analyzerWorker.addEventListener('error', () => {
+        // Worker内部の読み込み自体が失敗した場合（相対パスが解決できない等）
+        analyzerWorkerFailed = true;
+        analyzerWorker = null;
+      });
     } catch (e) {
-      // file:// で直接開いている場合など、Workerの生成自体が
-      // ブラウザのセキュリティ制約で失敗することがある。
-      throw new Error(
-        'バックグラウンド解析用のワーカーを起動できませんでした。' +
-        'このアプリはローカルサーバー（例: VS Codeの Live Server 等）経由で開くか、' +
-        'index.html と analyzer-worker.js を同じフォルダに置いた状態で使用してください。'
-      );
+      analyzerWorkerFailed = true;
+      throw buildWorkerUnavailableError();
     }
   }
   return analyzerWorker;
+}
+
+function buildWorkerUnavailableError() {
+  const isFileProtocol = window.location.protocol === 'file:';
+  const reason = isFileProtocol
+    ? 'このページを「ファイルをダブルクリックして開く」形（アドレス欄が file:// で始まる状態）で表示しているためです。ブラウザの仕様上、この開き方ではバックグラウンド処理（Web Worker）が使えません。'
+    : 'バックグラウンド解析用のワーカーの読み込みに失敗しました。index.html と analyzer-worker.js が同じフォルダにあるか確認してください。';
+  const howTo = isFileProtocol
+    ? '\n\n【対処方法】ごく簡単なローカルサーバーを立ててから開いてください。\n' +
+      '・Node.js がある場合: index.html のあるフォルダで\n' +
+      '   npx serve .\n' +
+      '  を実行し、表示されるURL（http://localhost:... など）をブラウザで開く\n' +
+      '・Python がある場合: 同フォルダで\n' +
+      '   python3 -m http.server 8000\n' +
+      '  を実行し、http://localhost:8000 をブラウザで開く\n' +
+      '・VS Code を使っている場合: 「Live Server」拡張機能をインストールし、index.html を右クリックして「Open with Live Server」'
+    : '';
+  return new Error(reason + howTo);
 }
 
 // AudioBufferはWorkerへ直接渡せないため、転送可能な形（チャンネルごとのFloat32Array）に変換する
@@ -456,31 +491,31 @@ function drawWaveform(canvas, peaks) {
   }
 }
 
-function drawSpectrogram(canvas, frames, sampleRate) {
+function drawSpectrogram(canvas, analysis) {
+  const { frames, sampleRate, magFlat, magLen } = analysis;
   const { ctx, width, height } = setupCanvasDPR(canvas);
   ctx.clearRect(0, 0, width, height);
-  if (frames.length === 0) return;
+  if (frames.length === 0 || !magFlat || !magLen) return;
 
   const maxBinFreq = 5000;
   const colW = width / frames.length;
 
   // 事前に最大値を求めてログスケール正規化
   let globalMax = 1e-6;
-  frames.forEach((f) => {
-    for (let i = 0; i < f.mag.length; i++) {
-      if (f.mag[i] > globalMax) globalMax = f.mag[i];
-    }
-  });
+  for (let i = 0; i < magFlat.length; i++) {
+    if (magFlat[i] > globalMax) globalMax = magFlat[i];
+  }
+
+  const fftSize = magLen * 2;
+  const binHz = sampleRate / fftSize;
+  const maxBin = Math.min(magLen, Math.floor(maxBinFreq / binHz));
 
   for (let fi = 0; fi < frames.length; fi++) {
-    const f = frames[fi];
-    const fftSize = f.mag.length * 2;
-    const binHz = sampleRate / fftSize;
-    const maxBin = Math.min(f.mag.length, Math.floor(maxBinFreq / binHz));
+    const base = fi * magLen;
     const x = fi * colW;
 
     for (let bi = 1; bi < maxBin; bi++) {
-      const val = f.mag[bi] / globalMax;
+      const val = magFlat[base + bi] / globalMax;
       const logVal = Math.log10(1 + val * 9); // 0-1 log圧縮
       if (logVal < 0.02) continue;
       const freq = bi * binHz;
@@ -494,7 +529,8 @@ function drawSpectrogram(canvas, frames, sampleRate) {
   }
 }
 
-function drawPitchNotes(canvas, frames, notes, duration) {
+function drawPitchNotes(canvas, analysis) {
+  const { frames, notes, duration, noteEnergiesFlat, noteEnergiesLen } = analysis;
   const { ctx, width, height } = setupCanvasDPR(canvas);
   ctx.clearRect(0, 0, width, height);
   if (duration <= 0) return;
@@ -523,19 +559,23 @@ function drawPitchNotes(canvas, frames, notes, duration) {
   }
 
   // 生の周波数強度（各フレームで最も強い音階を薄い点として表示）
-  ctx.fillStyle = 'rgba(127,224,168,0.18)';
-  frames.forEach((f) => {
-    if (f.isSilent || !f.noteEnergies) return;
-    let bestIdx = -1, bestVal = 0;
-    for (let i = 0; i < f.noteEnergies.length; i++) {
-      if (f.noteEnergies[i] > bestVal) { bestVal = f.noteEnergies[i]; bestIdx = i; }
-    }
-    if (bestIdx < 0) return;
-    const m = CHROMA_MIDI_MIN + bestIdx;
-    const x = xForT(f.t);
-    const y = yForMidi(m);
-    ctx.fillRect(x, y, 1.4, 1.4);
-  });
+  if (noteEnergiesFlat && noteEnergiesLen) {
+    ctx.fillStyle = 'rgba(127,224,168,0.18)';
+    frames.forEach((f, fi) => {
+      if (f.isSilent || !f.hasNoteEnergies) return;
+      const base = fi * noteEnergiesLen;
+      let bestIdx = -1, bestVal = 0;
+      for (let i = 0; i < noteEnergiesLen; i++) {
+        const v = noteEnergiesFlat[base + i];
+        if (v > bestVal) { bestVal = v; bestIdx = i; }
+      }
+      if (bestIdx < 0) return;
+      const m = CHROMA_MIDI_MIN + bestIdx;
+      const x = xForT(f.t);
+      const y = yForMidi(m);
+      ctx.fillRect(x, y, 1.4, 1.4);
+    });
+  }
 
   // ノートブロック
   notes.forEach((n) => {
@@ -602,8 +642,8 @@ function drawEventsVelocity(canvas, frames, events, duration) {
 
 function renderAllVisualizations(analysis) {
   drawWaveform(el.cvWave, analysis.waveformPeaks);
-  drawSpectrogram(el.cvSpec, analysis.frames, analysis.sampleRate);
-  drawPitchNotes(el.cvPitch, analysis.frames, analysis.notes, analysis.duration);
+  drawSpectrogram(el.cvSpec, analysis);
+  drawPitchNotes(el.cvPitch, analysis);
   drawEventsVelocity(el.cvEvent, analysis.frames, analysis.events, analysis.duration);
 }
 
@@ -874,12 +914,14 @@ el.btnDownloadJson.addEventListener('click', () => {
       amp: Math.round(e.amp * 1000) / 1000,
       centroid: Math.round(e.centroid)
     })),
-    frames: a.frames.map((f) => {
+    frames: a.frames.map((f, fi) => {
       let peakMidi = null, peakEnergy = 0;
-      if (f.noteEnergies) {
+      if (f.hasNoteEnergies && a.noteEnergiesFlat && a.noteEnergiesLen) {
+        const base = fi * a.noteEnergiesLen;
         let bestIdx = -1, bestVal = 0;
-        for (let i = 0; i < f.noteEnergies.length; i++) {
-          if (f.noteEnergies[i] > bestVal) { bestVal = f.noteEnergies[i]; bestIdx = i; }
+        for (let i = 0; i < a.noteEnergiesLen; i++) {
+          const v = a.noteEnergiesFlat[base + i];
+          if (v > bestVal) { bestVal = v; bestIdx = i; }
         }
         if (bestIdx >= 0) { peakMidi = CHROMA_MIDI_MIN + bestIdx; peakEnergy = bestVal; }
       }
@@ -902,3 +944,9 @@ window.addEventListener('resize', () => {
     renderAllVisualizations(state.analysis);
   }
 });
+
+// file:// から直接開かれている場合、Web Workerが使えないため
+// 解析を試す前の時点で気づけるよう警告バナーを表示しておく。
+if (window.location.protocol === 'file:' && el.fileProtocolWarning) {
+  el.fileProtocolWarning.classList.remove('hidden');
+}
