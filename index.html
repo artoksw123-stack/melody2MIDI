@@ -738,6 +738,16 @@ code{
         あわせて下の「最小ノート長」も短くすると、より多くの音が反映されます。
         （「和音・密集音」モードでは検出できた音をすべて鳴らすため、この設定は使用されません。強弱の調整は下の「ベロシティ反映の強さ」で行います。）
       </p>
+      <div class="control-row">
+        <div class="control-label">音声の周波数を中心にプロット<span class="unit">和音・密集音モード用</span></div>
+        <div class="control-input">
+          <div class="toggle" id="toggleCenterMelody"><div class="knob"></div></div>
+        </div>
+      </div>
+      <p style="font-size:11px; color:var(--ink-dim); margin: -4px 0 4px; line-height:1.6;">
+        「和音・密集音」モードで、人の声の自然な音域（目安：A2〜A6）を外れた音を弱め、その範囲内の音はなめらかに伸ばして再現します。
+        本来鳴っていないはずの極端な高音・低音（ノイズや倍音の誤検出など）が目立ちにくくなり、声の輪郭が聞き取りやすくなります。
+      </p>
 
       <details class="advanced">
         <summary>上級設定</summary>

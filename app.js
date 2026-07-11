@@ -78,6 +78,7 @@ const state = {
     trackMode: 'multi',
     noteMerge: 15,
     eventSens: 55,
+    centerOnMelody: false,
     instrument: '0' // GM音色番号。'auto'ならモードに応じた既定音色を使う（既定: 0 = Acoustic Grand Piano）
   }
 };
@@ -107,6 +108,7 @@ const el = {
   silenceThresh: $('silenceThresh'), silenceThreshVal: $('silenceThreshVal'),
   velSens: $('velSens'), velSensVal: $('velSensVal'),
   togglePitchBend: $('togglePitchBend'),
+  toggleCenterMelody: $('toggleCenterMelody'),
   trackMode: $('trackMode'),
   instrument: $('instrument'),
   noteMerge: $('noteMerge'), noteMergeVal: $('noteMergeVal'),
@@ -211,6 +213,7 @@ function setupToggle(toggleEl, key, defaultOn) {
 }
 setupToggle(el.toggleAutoFrame, 'autoFrame', true);
 setupToggle(el.togglePitchBend, 'pitchBend', true);
+setupToggle(el.toggleCenterMelody, 'centerOnMelody', false);
 
 // 通知トグルは params ではなく state 直下のフラグを操作する。
 // オンにした瞬間（ユーザー操作の直後）にブラウザの通知許可をリクエストする。
@@ -750,6 +753,24 @@ function hideProgress() {
 
 async function runAnalysis() {
   if (!state.audioBuffer || state.isAnalyzing) return;
+
+  // 「和音・密集音」モードは音の密度が高く、長時間の音声（ライブ配信の
+  // アーカイブ等）では非常に多くのノートを生成することがある。
+  // 内部的な自動調整・セーフガードは備えているが、あまりに長い場合は
+  // 解析にかなりの時間がかかるため、事前に一言確認しておく。
+  const durationMin = state.audioBuffer.duration / 60;
+  const resolvedModeForWarning = state.mode === 'auto' ? null : state.mode;
+  const mightUseChroma = state.mode === 'chroma' || state.mode === 'auto';
+  if (mightUseChroma && durationMin > 15) {
+    const proceed = confirm(
+      `読み込んだ音声は約${durationMin.toFixed(0)}分あります。\n\n` +
+      `「和音・密集音」モードは音の密度が高いため、長い音声では解析にかなりの時間がかかったり、` +
+      `生成されるノート数が非常に多くなることがあります（内部的に自動調整は行われます）。\n\n` +
+      `このまま解析を続けますか？`
+    );
+    if (!proceed) return;
+  }
+
   state.isAnalyzing = true;
   el.btnAnalyze.disabled = true;
   el.btnReanalyze.disabled = true;

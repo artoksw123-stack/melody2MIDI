@@ -450,6 +450,22 @@ async function analyzeAudio(audioBuffer, mode, params, onProgress) {
   await nextTick();
   const notes = buildSpectralNotes(frames, hopMs, params, profile, resolvedMode);
 
+  // ---------------------------------------------------------
+  // 絶対的な上限チェック（最終防衛ライン）
+  // 動的セーフガード（buildFullSpectrumNotes内）を通しても、
+  // 万が一ノート数が極端に多くなった場合、MIDIファイルの組み立て
+  // （toBytes等）でメモリ不足に陥る可能性がある。ここで安全な
+  // 範囲に収まっているか最終確認し、超えていれば分かりやすい
+  // エラーメッセージで処理を打ち切る（原因不明のクラッシュを防ぐ）。
+  // ---------------------------------------------------------
+  const HARD_NOTE_LIMIT = 1000000;
+  if (notes.length > HARD_NOTE_LIMIT) {
+    throw new Error(
+      `生成されたノート数が非常に多くなりすぎたため（約${notes.length.toLocaleString()}件）、処理を中止しました。` +
+      '音声が長い場合は「和音・密集音」モード以外を試すか、音声を短く分割してから解析することをおすすめします。'
+    );
+  }
+
   onProgress(0.95, '結果をまとめています...');
   await nextTick();
 
@@ -631,6 +647,17 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
   const numNotes = CHROMA_MIDI_MAX - CHROMA_MIDI_MIN + 1;
   const minNoteSec = params.minNoteMs / 1000;
 
+  // 長時間の音声（ライブ配信のアーカイブ等）を和音・密集音モードで
+  // 扱うと、フレーム数に比例してノート候補も増え、数十分を超えると
+  // 数十万〜数百万ノートに達してメモリ不足を招くことがある。
+  // これを避けるため、音声が長いほど「鳴っている」と判定する閾値を
+  // 自動的に厳しくし、そもそも生成されるノートの総数を抑える。
+  const totalDurationSec = frames.length > 0 ? frames[frames.length - 1].t : 0;
+  // 10分までは変更なし。そこから緩やかに厳しくし、1時間程度で
+  // 閾値を大きく引き上げる（弱い音を間引く）。
+  const durationScale = 1 + clamp((totalDurationSec - 600) / 3000, 0, 2);
+  const thresholdScale = 1 + clamp((totalDurationSec - 600) / 1800, 0, 4); // 10分〜40分でx1〜x5
+
   // 全フレーム・全音階を通じての最大エネルギー（参考値、ノイズフロア計算に使う）
   let globalMax = 1e-9;
   frames.forEach((f) => {
@@ -658,10 +685,43 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
   // 「鳴っている」とみなす下限は、実質ゼロ（ノイズフロア）とみなせる
   // 程度のごく小さい値に固定する。こちらは音階ごとの正規化とは別に、
   // 全体的な無音区間・暗騒音を弾くための絶対的な足切りとして使う。
-  const noiseFloor = globalMax * 0.006;
+  // 長い音声ではthresholdScaleにより自動的に厳しくなる。
+  const noiseFloor = globalMax * 0.006 * thresholdScale;
+
+  // ---------------------------------------------------------
+  // 声の自然な音域からの逸脱を抑える
+  // 一般的な人の声（地声〜裏声）の範囲を大きく外れる音域は、
+  // ノイズや倍音の誤検出である可能性が高く、そのまま同じ強さで
+  // 鳴らすと不自然に聞こえる。そこで、指定した範囲の外側にある
+  // 音階は、範囲の境界に近いほど弱く（なだらかに減衰）、
+  // 大きく外れるほどさらに弱くする。
+  // 急に音量差を付けると逆に不自然になるため、範囲の境界前後は
+  // なめらかに変化させる（ハードカットではない）。
+  // ---------------------------------------------------------
+  const centerOnMelody = !!params.centerOnMelody;
+  // 既定は「ラ(A2, MIDI45) 〜 ラ(A6, MIDI93)」。この範囲の外側を減衰させる。
+  const RANGE_LOW = 45;
+  const RANGE_HIGH = 93;
+  const ROLLOFF_SEMITONES = 6; // 境界からこの半音数でなだらかに減衰しきる
+
+  const rangeWeight = (noteIdx) => {
+    const midi = CHROMA_MIDI_MIN + noteIdx;
+    if (midi >= RANGE_LOW && midi <= RANGE_HIGH) return 1;
+    const dist = midi < RANGE_LOW ? (RANGE_LOW - midi) : (midi - RANGE_HIGH);
+    // 境界からdist半音離れるごとになだらかに減衰し、ROLLOFF_SEMITONESで最低値に達する
+    const t = clamp(dist / ROLLOFF_SEMITONES, 0, 1);
+    // なめらかな減衰カーブ（急に0にはせず、最低でも0.15程度は残す）
+    return 1 - t * t * (3 - 2 * t) * 0.85; // smoothstepベース、最低0.15
+  };
 
   const notes = [];
   const active = new Array(numNotes).fill(null);
+
+  // 動的セーフガード用の状態。ノート数が多くなりすぎたら
+  // isAudible の閾値をその場で引き上げ、以降の生成を抑制する。
+  // （メモリ不足クラッシュを防ぐための最終防衛ライン）
+  const NOTE_COUNT_SOFT_LIMIT = 300000;
+  const dynamicThresholdBoosted = { value: false };
 
   const velocityFromEnergy = (energy, noteIdx) => {
     // エネルギーをそのまま線形でベロシティにすると、強い音とごく弱い音の
@@ -678,7 +738,13 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
     // 「鳴らす」と判定された音は、どれだけ弱くても最低30は超えるようにする。
     // (30未満だとMIDI音源によってはほぼ聞こえないため)
     const MIN_VEL = 32;
-    const velocity = MIN_VEL + dbNorm * (127 - MIN_VEL);
+    let velocity = MIN_VEL + dbNorm * (127 - MIN_VEL);
+
+    if (centerOnMelody) {
+      const weight = rangeWeight(noteIdx);
+      velocity = MIN_VEL + (velocity - MIN_VEL) * weight;
+    }
+
     return Math.max(MIN_VEL, Math.min(127, Math.round(velocity)));
   };
 
@@ -710,6 +776,18 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
         expressionCurve,
         confidenceAvg: 1
       });
+
+      // ---------------------------------------------------------
+      // 動的セーフガード: 事前の見積もりだけに頼らず、実際に生成
+      // されたノート数がハードリミットに近づいたら、その場で
+      // 閾値を引き上げてノート生成を強制的に抑制する。
+      // 音声の内容次第で見積もりが外れることがあるため、実測値に
+      // 基づくこの仕組みが最終防衛ラインとしてメモリ不足クラッシュを
+      // 確実に防ぐ。
+      // ---------------------------------------------------------
+      if (notes.length > NOTE_COUNT_SOFT_LIMIT && !dynamicThresholdBoosted.value) {
+        dynamicThresholdBoosted.value = true;
+      }
     }
     active[noteIdx] = null;
   };
@@ -719,7 +797,29 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
   // 高音域ほど短く刻まれやすいという偏りが出る。
   // 「短く細かく刻む」方向に統一するため、ノートの最大長に
   // 上限を設け、それを超えたら一度区切って鳴らし直す。
-  const maxNoteSec = Math.max(0.06, (hopMs / 1000) * 4); // フレーム4個分程度が上限の目安
+  //
+  // ただし「音声の周波数を中心にプロット」がオンの場合は、
+  // 声の自然な音域（RANGE_LOW〜RANGE_HIGH）については、
+  // 短く刻むとかえって声がスタッカートのように不自然に
+  // 聞こえてしまうため、この上限を大幅に緩めてなめらかに
+  // 伸ばす。範囲の外側（元々ノイズ等で弱められている音域）は
+  // 従来通り短く刻んだままにする。
+  //
+  // 長時間の音声（ライブ配信のアーカイブ等）を和音・密集音モードで
+  // 扱うと、細かく刻むほどノート数が音声の長さに比例して増え、
+  // 数十分を超えると数十万〜数百万ノートに達してメモリ不足を
+  // 招くことがある。これを避けるため、音声が長いほど「短く刻む」側の
+  // 上限も自動的に緩め、ノート数の増加を抑える
+  // （durationScaleは冒頭で算出済み）。
+  const maxNoteSecShort = Math.max(0.06, (hopMs / 1000) * 4) * durationScale; // フレーム4個分程度が上限の目安
+  const maxNoteSecLong = 2.0 * durationScale; // 声の自然な音域はここまで伸ばしてよい
+  const maxNoteSecFor = (noteIdx) => {
+    if (centerOnMelody) {
+      const midi = CHROMA_MIDI_MIN + noteIdx;
+      if (midi >= RANGE_LOW && midi <= RANGE_HIGH) return maxNoteSecLong;
+    }
+    return maxNoteSecShort;
+  };
 
   for (let fi = 0; fi < frames.length; fi++) {
     const f = frames[fi];
@@ -735,10 +835,13 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
       // 「鳴っている」の判定は次の2つのANDにする:
       //   1. 全体としてノイズフロア(絶対的な暗騒音)を超えているか
       //   2. その音階自身が曲中で出した最大値に対して、無視できない
-      //      割合（1%程度）まで達しているか
+      //      割合まで達しているか（通常1%程度。長い音声ほど
+      //      thresholdScaleにより自動的に厳しくし、ノート数の
+      //      増加を抑える）
       // 2番目の条件により、高音域（絶対値は小さいが、その音階の中では
       // 十分に強い瞬間）も低音域と同じ基準で公平に拾えるようになる。
-      const isAudible = energy > noiseFloor && energy > perNoteMax[n] * 0.01;
+      const isAudible = energy > noiseFloor &&
+        energy > perNoteMax[n] * 0.01 * thresholdScale * (dynamicThresholdBoosted.value ? 8 : 1);
       const isOn = active[n] !== null;
       const vel = velocityFromEnergy(energy, n);
 
@@ -746,7 +849,7 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
         active[n] = { startIdx: fi, velSum: vel, frameCount: 1, velTrack: [{ t: f.t, vel }] };
       } else if (isOn && isAudible) {
         const elapsedSec = f.t - frames[active[n].startIdx].t;
-        if (elapsedSec >= maxNoteSec) {
+        if (elapsedSec >= maxNoteSecFor(n)) {
           // 上限に達したので一度区切り、同じフレームから新しいノートとして続ける
           flushNote(n, fi);
           active[n] = { startIdx: fi, velSum: vel, frameCount: 1, velTrack: [{ t: f.t, vel }] };
@@ -842,6 +945,25 @@ function writeVarLen(value) {
   return bytes;
 }
 
+// writeVarLenのTypedArray直接書き込み版。
+// 大量イベントを扱う toBytes() で、通常配列への1バイトずつのpushを
+// 避けるために使う（詳細は toBytes() 内のコメントを参照）。
+function writeVarLenInto(buf, pos, value) {
+  let buffer = value & 0x7f;
+  value >>= 7;
+  while (value > 0) {
+    buffer <<= 8;
+    buffer |= (value & 0x7f) | 0x80;
+    value >>= 7;
+  }
+  while (true) {
+    buf[pos++] = buffer & 0xff;
+    if (buffer & 0x80) buffer >>= 8;
+    else break;
+  }
+  return pos;
+}
+
 /* ---------------- MIDIバイトビルダー ---------------- */
 class MidiTrackBuilder {
   constructor(name) {
@@ -890,20 +1012,38 @@ class MidiTrackBuilder {
   }
 
   toBytes() {
-    // tick順にソート（同tickはイベント追加順を維持: stable sort）
-    const sorted = this.events
-      .map((e, i) => ({ ...e, _i: i }))
-      .sort((a, b) => (a.tick - b.tick) || (a._i - b._i));
+    // tick順にソート（同tickはイベント追加順を維持: stable sort）。
+    // Array.prototype.sortはstableなので、_i を使った複製は不要
+    // （元のインデックス順は配列の並び自体で保たれる）。
+    const sorted = this.events.slice().sort((a, b) => a.tick - b.tick);
 
-    const data = [];
+    // ---------------------------------------------------------
+    // 大量のノート（長時間・和音モード等で数十万〜数百万イベントに
+    // なりうる）を扱う際、通常のJS配列に1バイトずつpushしていく
+    // 実装だと、配列の要素がすべて「ボックス化された数値」として
+    // メモリに保持されるため非常に重く、長時間の音源では
+    // メモリ不足でクラッシュすることがあった。
+    // そこで、最初にバイト数の上限を見積もって Uint8Array を
+    // 確保し、そこへ直接書き込む方式に変更する（1バイト=1要素の
+    // TypedArrayなので、通常配列よりずっと省メモリになる）。
+    // ---------------------------------------------------------
+    // 1イベントの最大バイト数を安全側に見積もる:
+    //   デルタタイム(可変長, 最大4バイト程度) + イベント本体(最大3バイト)
+    const maxBytesPerEvent = 8;
+    const buf = new Uint8Array(sorted.length * maxBytesPerEvent);
+    let pos = 0;
     let lastTick = 0;
-    for (const e of sorted) {
+
+    for (let i = 0; i < sorted.length; i++) {
+      const e = sorted[i];
       const delta = Math.max(0, e.tick - lastTick);
-      data.push(...writeVarLen(delta));
-      data.push(...e.bytes);
+      pos = writeVarLenInto(buf, pos, delta);
+      const eb = e.bytes;
+      for (let j = 0; j < eb.length; j++) buf[pos++] = eb[j];
       lastTick = e.tick;
     }
-    const trackData = new Uint8Array(data);
+
+    const trackData = buf.subarray(0, pos);
     const header = new Uint8Array(8);
     const dv = new DataView(header.buffer);
     header[0] = 0x4d; header[1] = 0x54; header[2] = 0x72; header[3] = 0x6b; // "MTrk"
