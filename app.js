@@ -79,7 +79,8 @@ const state = {
     noteMerge: 15,
     eventSens: 55,
     centerOnMelody: false,
-    instrument: '0' // GM音色番号。'auto'ならモードに応じた既定音色を使う（既定: 0 = Acoustic Grand Piano）
+    instrument: '0', // GM音色番号。'auto'ならモードに応じた既定音色を使う（既定: 0 = Acoustic Grand Piano）
+    maxNoteLimit: 1000000 // 和音・密集音モードでのノート数上限（超えると解析を中止）
   }
 };
 
@@ -111,6 +112,7 @@ const el = {
   toggleCenterMelody: $('toggleCenterMelody'),
   trackMode: $('trackMode'),
   instrument: $('instrument'),
+  maxNoteLimit: $('maxNoteLimit'),
   noteMerge: $('noteMerge'), noteMergeVal: $('noteMergeVal'),
   eventSens: $('eventSens'), eventSensVal: $('eventSensVal'),
   toggleNotify: $('toggleNotify'),
@@ -239,6 +241,10 @@ el.trackMode.addEventListener('change', () => {
 
 el.instrument.addEventListener('change', () => {
   state.params.instrument = el.instrument.value;
+});
+
+el.maxNoteLimit.addEventListener('change', () => {
+  state.params.maxNoteLimit = parseInt(el.maxNoteLimit.value, 10);
 });
 
 // フレーム長/ホップ長の自動調整トグル → 手動スライダー無効化の視覚化

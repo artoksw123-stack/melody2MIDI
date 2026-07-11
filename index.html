@@ -758,6 +758,22 @@ code{
             <div class="control-value" id="eventSensVal">55%</div>
           </div>
         </div>
+        <div class="control-row">
+          <div class="control-label">ノート数上限<span class="unit">和音・密集音モード用</span></div>
+          <div class="control-input">
+            <select id="maxNoteLimit">
+              <option value="500000">50万（メモリに余裕がない場合）</option>
+              <option value="1000000" selected>100万（標準）</option>
+              <option value="2000000">200万（メモリに余裕がある場合）</option>
+              <option value="5000000">500万（高性能な端末向け）</option>
+            </select>
+          </div>
+        </div>
+        <p style="font-size:11px; color:var(--ink-dim); margin: 4px 0 0; line-height:1.6;">
+          「和音・密集音」モードで長い音声を扱うと、生成されるノート数が非常に多くなることがあります。
+          この上限を超えそうになると自動的に間引かれ、それでも超える場合は解析を中止してお知らせします。
+          お使いの端末のメモリに余裕がある場合は上限を増やせますが、増やすほどブラウザのメモリ使用量も大きくなります。
+        </p>
       </details>
     </div>
   </div>

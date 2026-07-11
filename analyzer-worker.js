@@ -457,12 +457,14 @@ async function analyzeAudio(audioBuffer, mode, params, onProgress) {
   // （toBytes等）でメモリ不足に陥る可能性がある。ここで安全な
   // 範囲に収まっているか最終確認し、超えていれば分かりやすい
   // エラーメッセージで処理を打ち切る（原因不明のクラッシュを防ぐ）。
+  // 上限値はユーザーが設定で調整できる（使用中の端末のメモリに
+  // 余裕がある場合はより多くのノートを許可できる）。
   // ---------------------------------------------------------
-  const HARD_NOTE_LIMIT = 1000000;
+  const HARD_NOTE_LIMIT = params.maxNoteLimit || 1000000;
   if (notes.length > HARD_NOTE_LIMIT) {
     throw new Error(
-      `生成されたノート数が非常に多くなりすぎたため（約${notes.length.toLocaleString()}件）、処理を中止しました。` +
-      '音声が長い場合は「和音・密集音」モード以外を試すか、音声を短く分割してから解析することをおすすめします。'
+      `生成されたノート数が非常に多くなりすぎたため（約${notes.length.toLocaleString()}件、上限${HARD_NOTE_LIMIT.toLocaleString()}件）、処理を中止しました。` +
+      '「解析設定」の上級設定にある「ノート数上限」を増やすか、音声が長い場合は「和音・密集音」モード以外を試す、音声を短く分割してから解析することをおすすめします。'
     );
   }
 
@@ -720,7 +722,13 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
   // 動的セーフガード用の状態。ノート数が多くなりすぎたら
   // isAudible の閾値をその場で引き上げ、以降の生成を抑制する。
   // （メモリ不足クラッシュを防ぐための最終防衛ライン）
-  const NOTE_COUNT_SOFT_LIMIT = 300000;
+  // ノート内の細かい強弱変化(CC11)を持たせない設計にしたことで
+  // 1ノートあたりのメモリ消費が大幅に下がったため、以前より
+  // 高めの値に設定できる。ユーザーが設定した上限（HARD_NOTE_LIMIT
+  // 相当）の半分程度を目安に、そこに近づいたら早めにブレーキを
+  // かけ始める。
+  const hardLimitForSoft = params.maxNoteLimit || 1000000;
+  const NOTE_COUNT_SOFT_LIMIT = Math.round(hardLimitForSoft * 0.5);
   const dynamicThresholdBoosted = { value: false };
 
   const velocityFromEnergy = (energy, noteIdx) => {
@@ -758,13 +766,10 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
     // 全部鳴らす方針でも、あまりに短い音は最小ノート長で間引く
     if (durSec * 1000 >= minNoteSec * 1000 * 0.6) {
       const avgVelocity = Math.round(cur.velSum / cur.frameCount);
-      // ノート内でのベロシティの時間変化をエクスプレッション(CC11)として残す。
-      // 3フレームに1回程度の間引きで十分（データ量を抑えつつ強弱の推移は残す）
-      const expressionCurve = [];
-      const step = Math.max(1, Math.floor(cur.velTrack.length / 40));
-      for (let i = 0; i < cur.velTrack.length; i += step) {
-        expressionCurve.push({ t: cur.velTrack[i].t, value: cur.velTrack[i].vel });
-      }
+      // 「和音・密集音」モードはノート数自体が非常に多くなりうるため、
+      // ノート内の細かい強弱変化（CC11エクスプレッション）は持たせず、
+      // ベロシティ1つだけで強さを表現する。これによりMIDIイベント数を
+      // 大幅に抑え、長時間の音声でもメモリ不足を起こしにくくする。
       notes.push({
         startTime: startFrame.t,
         endTime: endFrame.t + (hopMs / 1000),
@@ -773,7 +778,7 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
         velocity: Math.max(1, Math.min(127, avgVelocity)),
         frameIndices: [],
         pitchBendCurve: [],
-        expressionCurve,
+        expressionCurve: [],
         confidenceAvg: 1
       });
 
@@ -846,17 +851,16 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
       const vel = velocityFromEnergy(energy, n);
 
       if (!isOn && isAudible) {
-        active[n] = { startIdx: fi, velSum: vel, frameCount: 1, velTrack: [{ t: f.t, vel }] };
+        active[n] = { startIdx: fi, velSum: vel, frameCount: 1 };
       } else if (isOn && isAudible) {
         const elapsedSec = f.t - frames[active[n].startIdx].t;
         if (elapsedSec >= maxNoteSecFor(n)) {
           // 上限に達したので一度区切り、同じフレームから新しいノートとして続ける
           flushNote(n, fi);
-          active[n] = { startIdx: fi, velSum: vel, frameCount: 1, velTrack: [{ t: f.t, vel }] };
+          active[n] = { startIdx: fi, velSum: vel, frameCount: 1 };
         } else {
           active[n].velSum += vel;
           active[n].frameCount++;
-          active[n].velTrack.push({ t: f.t, vel });
         }
       } else if (isOn) {
         flushNote(n, fi);
