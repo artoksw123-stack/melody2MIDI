@@ -167,11 +167,13 @@ function accumulateNoteEnergies(energiesOut, mag, sampleRate, fftSize, loMidi, h
 // マルチ解像度でノートエネルギーを計算する。
 // mono: 全体の音声波形(モノラル), centerSample: フレーム中心のサンプル位置
 // baseMag/baseFftSize: 通常フレーム長でのFFT結果(高音域バンド用に再利用する)
-function computeNoteEnergiesMultiRes(mono, sampleRate, centerSample, baseMag, baseFftSize) {
+// persistentCache: フレームをまたいで使い回すキャッシュ（省略時は毎回計算）。
+//   長い窓（低音域用）は数msずれてもデータの大部分が重複するため、
+//   一定間隔でのみ再計算し、間のフレームは直前の結果を再利用することで
+//   精度をほぼ落とさずに計算量を大幅に削減できる。
+// frameIndex: 現在のフレーム番号（間引き判定に使用）
+function computeNoteEnergiesMultiRes(mono, sampleRate, centerSample, baseMag, baseFftSize, persistentCache, frameIndex) {
   const energies = new Float32Array(CHROMA_MIDI_MAX - CHROMA_MIDI_MIN + 1);
-
-  // バンドごとに処理。同じwindowSecのバンドはキャッシュして使い回す
-  const cache = new Map();
 
   let prevMax = CHROMA_MIDI_MIN - 1;
   for (const band of CHROMA_BANDS) {
@@ -184,19 +186,41 @@ function computeNoteEnergiesMultiRes(mono, sampleRate, centerSample, baseMag, ba
       accumulateNoteEnergies(energies, baseMag, sampleRate, baseFftSize, loMidi, hiMidi);
     } else {
       const key = band.windowSec;
-      let entry = cache.get(key);
-      if (!entry) {
+      let entry = null;
+
+      if (persistentCache) {
+        // 窓長に応じて再計算の間隔を決める。窓が長い（低音域）ほど、
+        // 音の変化に対してその窓自体が元々ゆっくりとしか反応しないため、
+        // 間引いても実質的な精度低下はほとんどない。
+        // 目安: 窓の1/8程度の間隔で再計算すれば十分追従できる。
+        const recalcIntervalSec = band.windowSec / 16;
+        const cached = persistentCache.get(key);
+        const needRecalc = !cached || (centerSample - cached.centerSample) / sampleRate >= recalcIntervalSec;
+
+        if (needRecalc) {
+          const winSamples = Math.round(sampleRate * band.windowSec);
+          const half = Math.floor(winSamples / 2);
+          const start = Math.max(0, centerSample - half);
+          const end = Math.min(mono.length, centerSample + half);
+          const slice = mono.subarray(start, end);
+          const fftMin = nextPow2(winSamples);
+          const mag = computeSpectrum(slice, fftMin);
+          const fftSize = Math.max(nextPow2(slice.length), fftMin);
+          entry = { mag, fftSize, centerSample };
+          persistentCache.set(key, entry);
+        } else {
+          entry = cached;
+        }
+      } else {
         const winSamples = Math.round(sampleRate * band.windowSec);
         const half = Math.floor(winSamples / 2);
         const start = Math.max(0, centerSample - half);
         const end = Math.min(mono.length, centerSample + half);
         const slice = mono.subarray(start, end);
-        // 長い窓に対しては十分なFFT分解能を確保(ゼロパディングも併用)
         const fftMin = nextPow2(winSamples);
         const mag = computeSpectrum(slice, fftMin);
         const fftSize = Math.max(nextPow2(slice.length), fftMin);
         entry = { mag, fftSize };
-        cache.set(key, entry);
       }
       accumulateNoteEnergies(energies, entry.mag, sampleRate, entry.fftSize, loMidi, hiMidi);
     }
@@ -356,6 +380,11 @@ function modeProfile(mode, params) {
     case 'chroma':
       // 和音・密集音: 同時に複数の音階を許可
       return { ...base, maxPolyphony: 8, energyThreshold: baseThreshold };
+    case 'melody_chord':
+      // メロディ和音: ベル・ピアノ等、倍音が豊かな音源向け。
+      // 複数の基音を同時に許可しつつ、倍音除去を行う専用ロジックを使う
+      // （buildMelodyChordNotesで処理する）。
+      return { ...base, maxPolyphony: 6, energyThreshold: baseThreshold * 0.9 };
     default:
       return base;
   }
@@ -397,6 +426,14 @@ async function analyzeAudio(audioBuffer, mode, params, onProgress) {
   let prevAmp = 0;
   let prevCentroid = 0;
 
+  // 音階ごとのエネルギー計算で使う永続キャッシュ。
+  // 低音域用の長い窓（最大500ms）は数msずれてもデータの大部分が
+  // 重複するため、フレームをまたいで一定間隔でのみ再計算し、
+  // 間のフレームは直前の結果を再利用することで、精度をほぼ
+  // 落とさずに計算量を大幅に削減する（詳細は
+  // computeNoteEnergiesMultiRes 内のコメントを参照）。
+  const multiResCache = new Map();
+
   // ---------------------------------------------------------
   // 全モード共通: 一定時間(フレーム)ごとに区切り、その区間の
   // 周波数ごとの強さ(スペクトル)をそのまま調べる、というシンプルな方式。
@@ -422,7 +459,7 @@ async function analyzeAudio(audioBuffer, mode, params, onProgress) {
     let noteEnergies = null;
     if (!isSilent) {
       const centerSample = start + Math.floor(frameSize / 2);
-      noteEnergies = computeNoteEnergiesMultiRes(mono, sampleRate, centerSample, mag, fftSize);
+      noteEnergies = computeNoteEnergiesMultiRes(mono, sampleRate, centerSample, mag, fftSize, multiResCache, fi);
     }
 
     // イベント（立ち上がり）検出用の差分特徴
@@ -538,6 +575,9 @@ function detectEvents(frames, params, profile) {
 function buildSpectralNotes(frames, hopMs, params, profile, resolvedMode) {
   if (resolvedMode === 'chroma') {
     return buildFullSpectrumNotes(frames, hopMs, params, profile);
+  }
+  if (resolvedMode === 'melody_chord') {
+    return buildMelodyChordNotes(frames, hopMs, params, profile);
   }
 
   const numNotes = CHROMA_MIDI_MAX - CHROMA_MIDI_MIN + 1;
@@ -875,6 +915,202 @@ function buildFullSpectrumNotes(frames, hopMs, params) {
   return notes;
 }
 
+// ---------------------------------------------------------
+// 「メロディ和音」モード専用のノート化。
+//
+// ベルやピアノのような倍音が豊かな音源では、単純に「一番強い
+// 周波数」を拾うと、実際に鳴らされた音（基音）ではなく、その
+// 倍音（2倍・3倍などの整数次高調波）を誤って音として拾って
+// しまうことがある。
+//
+// これを避けるため、各フレームで次の手順を踏む:
+//   1. 全音階のエネルギーを強い順に並べる
+//   2. 強い順に「まだ倍音として除外されていない」音階を基音として
+//      採用する
+//   3. 採用した音階の整数次倍音（+12半音=2倍音, +19半音=3倍音,
+//      +24半音=4倍音, ...）にあたる音階は、これ以降「倍音の疑いが
+//      ある」として基音候補から除外する
+//   4. maxPolyphony個の基音が決まるか、閾値を下回るまで繰り返す
+//
+// 「倍音として除外された音階」であっても、既に別フレームで
+// 独立した音として鳴り始めている場合はそのまま継続させる
+// （後から別の基音の倍音と重なっただけで、鳴っている音を
+// 途中で消してしまうと不自然になるため）。
+// ---------------------------------------------------------
+function buildMelodyChordNotes(frames, hopMs, params, profile) {
+  const numNotes = CHROMA_MIDI_MAX - CHROMA_MIDI_MIN + 1;
+  const minNoteSec = params.minNoteMs / 1000;
+  const minMidiIdx = Math.max(0, profile.minMidi - CHROMA_MIDI_MIN);
+  const maxMidiIdx = Math.min(numNotes - 1, profile.maxMidi - CHROMA_MIDI_MIN);
+  const maxPolyphony = profile.maxPolyphony || 6;
+
+  const totalDurationSec = frames.length > 0 ? frames[frames.length - 1].t : 0;
+  const thresholdScale = 1 + clamp((totalDurationSec - 600) / 1800, 0, 4);
+
+  // 音階ごとの最大エネルギーで正規化（高音域が薄くなりすぎないように）
+  const perNoteMax = new Float32Array(numNotes).fill(1e-9);
+  let globalMax = 1e-9;
+  frames.forEach((f) => {
+    if (!f.noteEnergies) return;
+    for (let i = minMidiIdx; i <= maxMidiIdx; i++) {
+      if (f.noteEnergies[i] > perNoteMax[i]) perNoteMax[i] = f.noteEnergies[i];
+      if (f.noteEnergies[i] > globalMax) globalMax = f.noteEnergies[i];
+    }
+  });
+
+  const noiseFloor = globalMax * 0.008 * thresholdScale;
+  const onThreshold = profile.energyThreshold;
+  // メロディとして機能させることを重視するモードのため、
+  // 単純な純音でもFFTのスペクトル漏れで隣接半音にわずかに
+  // エネルギーがにじみ出ることがある。これを誤って別音として
+  // 拾わないよう、鳴り続ける条件（offThreshold）はやや厳しめにする。
+  const offThreshold = onThreshold * 0.7;
+
+  // 整数次倍音として除外する倍率（2倍音〜6倍音まで）。
+  // 半音単位に換算した際の許容誤差（この範囲内なら倍音とみなす）。
+  const HARMONIC_MULTIPLES = [2, 3, 4, 5, 6];
+  const HARMONIC_TOLERANCE_SEMITONES = 0.5;
+
+  // 各倍数について、基音からの半音距離をあらかじめ計算しておく
+  // （12*log2(n) は倍率nに対応する半音距離。2倍音=12半音、3倍音=19.02半音...）
+  const HARMONIC_SEMITONE_OFFSETS = HARMONIC_MULTIPLES.map((n) => 12 * Math.log2(n));
+
+  const notes = [];
+  const active = new Array(numNotes).fill(null);
+  const dynamicThresholdBoosted = { value: false };
+  const hardLimitForSoft = params.maxNoteLimit || 1000000;
+  const NOTE_COUNT_SOFT_LIMIT = Math.round(hardLimitForSoft * 0.5);
+
+  const velocityFromEnergy = (energy, noteIdx) => {
+    const norm = Math.min(1, energy / perNoteMax[noteIdx]);
+    const db = 20 * Math.log10(Math.max(norm, 1e-6));
+    const sens = params.velSensPercent / 100;
+    const dbRange = 36 + (1 - sens) * 24;
+    const dbNorm = clamp((db + dbRange) / dbRange, 0, 1);
+    const MIN_VEL = 28;
+    const velocity = MIN_VEL + dbNorm * (127 - MIN_VEL);
+    return Math.max(MIN_VEL, Math.min(127, Math.round(velocity)));
+  };
+
+  const flushNote = (noteIdx, endFrameIdx) => {
+    const cur = active[noteIdx];
+    if (!cur) return;
+    const startFrame = frames[cur.startIdx];
+    const endFrame = frames[endFrameIdx - 1] || startFrame;
+    const durSec = endFrame.t - startFrame.t + (hopMs / 1000);
+
+    if (durSec * 1000 >= minNoteSec * 1000 * 0.6) {
+      const avgVelocity = Math.round(cur.velSum / cur.frameCount);
+      notes.push({
+        startTime: startFrame.t,
+        endTime: endFrame.t + (hopMs / 1000),
+        midi: CHROMA_MIDI_MIN + noteIdx,
+        centsOff: 0,
+        velocity: Math.max(1, Math.min(127, avgVelocity)),
+        frameIndices: [],
+        pitchBendCurve: [],
+        expressionCurve: [],
+        confidenceAvg: 1
+      });
+      if (notes.length > NOTE_COUNT_SOFT_LIMIT && !dynamicThresholdBoosted.value) {
+        dynamicThresholdBoosted.value = true;
+      }
+    }
+    active[noteIdx] = null;
+  };
+
+  // 与えられたフレームのエネルギー配列から、倍音を除いた基音候補の
+  // 集合（Set<noteIdx>）を求める。
+  //
+  // 判定基準は「そのフレーム内での最大エネルギーに対する比率」を使う
+  // （音階ごとの過去最大値=perNoteMaxで正規化すると、単発のスペクトル
+  // 漏れやノイズであっても、その音階にとってはその瞬間が「過去最大」
+  // になってしまい、常に高い相対値が出て誤検出してしまうため）。
+  const selectFundamentals = (noteEnergies, frameMax) => {
+    const ranked = [];
+    for (let n = minMidiIdx; n <= maxMidiIdx; n++) {
+      const relToFrame = noteEnergies[n] / frameMax;
+      if (noteEnergies[n] > noiseFloor && relToFrame >= offThreshold) {
+        ranked.push([n, noteEnergies[n], relToFrame]);
+      }
+    }
+    // 倍音除去の優先順位は「そのフレーム内での絶対的なエネルギーの
+    // 強さ」で決める。
+    ranked.sort((a, b) => b[1] - a[1]);
+
+    const excluded = new Set(); // 倍音として除外された noteIdx
+    const fundamentals = new Set();
+
+    for (const [noteIdx, , relToFrame] of ranked) {
+      if (fundamentals.size >= maxPolyphony) break;
+      if (excluded.has(noteIdx)) continue;
+      if (relToFrame < onThreshold) continue; // 新規採用にはonThreshold（offThresholdより厳しい）を要求
+
+      fundamentals.add(noteIdx);
+
+      // この音階を基音として確定したので、その整数次倍音にあたる
+      // 音階を今後の候補から除外する
+      for (const semis of HARMONIC_SEMITONE_OFFSETS) {
+        const harmonicIdxFloat = noteIdx + semis;
+        const harmonicIdx = Math.round(harmonicIdxFloat);
+        if (Math.abs(harmonicIdxFloat - harmonicIdx) > HARMONIC_TOLERANCE_SEMITONES) continue;
+        if (harmonicIdx >= minMidiIdx && harmonicIdx <= maxMidiIdx) {
+          excluded.add(harmonicIdx);
+        }
+      }
+    }
+    return fundamentals;
+  };
+
+  for (let fi = 0; fi < frames.length; fi++) {
+    const f = frames[fi];
+    if (!f.noteEnergies || f.isSilent) {
+      for (let n = minMidiIdx; n <= maxMidiIdx; n++) {
+        if (active[n]) flushNote(n, fi);
+      }
+      continue;
+    }
+
+    // このフレーム内での最大エネルギー（相対強度の基準に使う）
+    let frameMax = 1e-9;
+    for (let n = minMidiIdx; n <= maxMidiIdx; n++) {
+      if (f.noteEnergies[n] > frameMax) frameMax = f.noteEnergies[n];
+    }
+
+    const fundamentals = selectFundamentals(f.noteEnergies, frameMax);
+
+    for (let n = minMidiIdx; n <= maxMidiIdx; n++) {
+      const energy = f.noteEnergies[n];
+      const isOn = active[n] !== null;
+      // 「鳴らし続けてよい」条件は新規採用より緩める（offThreshold基準）。
+      // 既に鳴っている音は、倍音除去の対象になっても消さない
+      // （他の基音の倍音とたまたま重なっただけの可能性があるため）。
+      // 判定はフレーム内の相対強度（frameMax比）を使う。
+      const isSustainable = isOn && energy > noiseFloor &&
+        (energy / frameMax) >= offThreshold * (dynamicThresholdBoosted.value ? 4 : 1);
+      const isNewCandidate = fundamentals.has(n) &&
+        energy > noiseFloor * (dynamicThresholdBoosted.value ? 4 : 1);
+
+      if (!isOn && isNewCandidate) {
+        const vel = velocityFromEnergy(energy, n);
+        active[n] = { startIdx: fi, velSum: vel, frameCount: 1 };
+      } else if (isOn && (isNewCandidate || isSustainable)) {
+        const vel = velocityFromEnergy(energy, n);
+        active[n].velSum += vel;
+        active[n].frameCount++;
+      } else if (isOn) {
+        flushNote(n, fi);
+      }
+    }
+  }
+  for (let n = minMidiIdx; n <= maxMidiIdx; n++) {
+    if (active[n]) flushNote(n, frames.length);
+  }
+
+  notes.sort((a, b) => a.startTime - b.startTime || a.midi - b.midi);
+  return notes;
+}
+
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -1131,6 +1367,7 @@ function instrumentForMode(mode) {
     case 'rhythm': return 0;
     case 'noise': return 96;       // FX (rain) 系のパッド
     case 'chroma': return 0;       // Acoustic Grand Piano(和音を鳴らすのに適する)
+    case 'melody_chord': return 14; // Tubular Bells(発車メロディ等のベル系音源向け)
     default: return 0;
   }
 }

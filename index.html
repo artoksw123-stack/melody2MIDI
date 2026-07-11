@@ -606,11 +606,11 @@ code{
     </div>
     <div class="panel-body">
       <div class="dropzone" id="dropzone">
-        <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.webm,audio/*">
+        <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.webm,.aiff,.aif,audio/*">
         <div id="dropzoneEmpty">
           <div class="glyph">▁▃▅▇▅▃▁</div>
           <div class="prompt">クリックまたはドラッグ&ドロップで音声ファイルを選択</div>
-          <div class="hint">対応形式: MP3 / WAV / M4A / AAC / OGG / FLAC / WEBM</div>
+          <div class="hint">対応形式: MP3 / WAV / M4A / AAC / OGG / FLAC / WEBM / AIFF</div>
         </div>
         <div id="dropzoneLoaded" class="file-loaded hidden">
           <div>
@@ -759,7 +759,7 @@ code{
           </div>
         </div>
         <div class="control-row">
-          <div class="control-label">ノート数上限<span class="unit">和音・密集音モード用</span></div>
+          <div class="control-label">ノート数上限<span class="unit">和音・密集音／メロディ和音モード用</span></div>
           <div class="control-input">
             <select id="maxNoteLimit">
               <option value="500000">50万（メモリに余裕がない場合）</option>
